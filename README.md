@@ -8,7 +8,7 @@ This branch only holds the automation for the fork. The code is in `master` and 
 - Every other branch whose name does not exist upstream is a feature branch built on top of `master`. Branches copied from upstream (`beta`, `dependabot/...`) are ignored. One branch per pull request, squashed to one commit, as [CONTRIBUTING.md](https://github.com/TelegramMessenger/Telegram-iOS/blob/master/.github/CONTRIBUTING.md) asks.
 - `fork-automation` is this branch, the default one, so that scheduled workflows can run.
 
-## What `sync-upstream.yml` does (every 6 hours, or manually from the Actions tab)
+## What `sync-upstream.yml` does (every Monday at 06:17 UTC, or manually from the Actions tab)
 
 1. Fast-forwards `master` to upstream.
 2. Rebases each feature branch onto the new `master` and force-pushes it with a lease. If there is a conflict, the branch is left as is, the run fails and the branch head gets a red `fork-ci/upstream-sync` status.
