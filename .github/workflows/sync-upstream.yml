@@ -1,0 +1,252 @@
+name: Sync upstream & verify branches
+
+# Keeps this fork in step with TelegramMessenger/Telegram-iOS:
+#   1. fast-forwards `master` to upstream `master`;
+#   2. rebases every other branch onto it (as CONTRIBUTING.md asks), force-pushing with lease;
+#   3. builds each branch head for the iOS simulator and reports the result as a commit status.
+#
+# Lives on the default branch `fork-automation` so that `master` stays an exact mirror
+# and feature branches stay free of fork-only files.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      build_branch:
+        description: 'Force a build of this branch (empty = only branches without a result)'
+        required: false
+        default: ''
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  statuses: write
+
+env:
+  UPSTREAM_URL: https://github.com/TelegramMessenger/Telegram-iOS.git
+  BUILD_CONTEXT: fork-ci/simulator-build
+  SYNC_CONTEXT: fork-ci/upstream-sync
+  # Branches that are never rebased or built.
+  SKIP_BRANCHES: 'master fork-automation'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      builds: ${{ steps.plan.outputs.builds }}
+    env:
+      # GITHUB_TOKEN cannot push commits that touch .github/workflows. If upstream ever
+      # changes its workflows, add a classic PAT with `repo` + `workflow` scopes as SYNC_TOKEN.
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+    steps:
+      - name: Fetch fork and upstream
+        run: |
+          set -euo pipefail
+          git init -q repo
+          cd repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch -q --no-tags upstream master
+          git fetch -q --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Fast-forward master
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          upstream_head=$(git rev-parse upstream/master)
+          # A plain (non-force) push only succeeds as a fast-forward, so local commits on master are never lost.
+          if ! git push origin "$upstream_head:refs/heads/master"; then
+            echo "::error::master has commits that are not in upstream. Move them to a feature branch, then reset master to upstream/master."
+            exit 1
+          fi
+          git fetch -q --no-tags origin master:refs/remotes/origin/master
+
+      - name: Rebase branches onto upstream master
+        id: rebase
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          upstream_head=$(git rev-parse upstream/master)
+          conflicts=()
+          for branch in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin); do
+            [ "$branch" = HEAD ] && continue
+            [[ " $SKIP_BRANCHES " == *" $branch "* ]] && continue
+
+            old_head=$(git rev-parse "origin/$branch")
+            if git merge-base --is-ancestor "$upstream_head" "$old_head"; then
+              echo "$branch: already on top of upstream"
+              continue
+            fi
+
+            git checkout -q --detach "$old_head"
+            if git rebase -q "$upstream_head"; then
+              git push --force-with-lease="refs/heads/$branch:$old_head" origin "HEAD:refs/heads/$branch"
+              echo "$branch: rebased $(git rev-parse --short "$old_head") -> $(git rev-parse --short HEAD)"
+            else
+              git rebase --abort
+              conflicts+=("$branch")
+              echo "::error::$branch: rebase onto upstream master has conflicts, rebase it manually"
+              gh api "repos/$GITHUB_REPOSITORY/statuses/$old_head" -f state=failure -f context="$SYNC_CONTEXT" \
+                -f description="Conflicts with upstream master, rebase manually" \
+                -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > /dev/null
+            fi
+          done
+          echo "conflicts=${conflicts[*]:-}" >> "$GITHUB_OUTPUT"
+
+      - name: Pick branches to build
+        id: plan
+        working-directory: repo
+        env:
+          FORCE_BRANCH: ${{ inputs.build_branch }}
+        run: |
+          set -euo pipefail
+          git fetch -q --no-tags --prune origin '+refs/heads/*:refs/remotes/origin/*'
+          builds='[]'
+          for branch in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin); do
+            [ "$branch" = HEAD ] && continue
+            [[ " $SKIP_BRANCHES " == *" $branch "* ]] && continue
+            sha=$(git rev-parse "origin/$branch")
+            # Each commit is built once; a forced branch is rebuilt regardless.
+            state=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/statuses" \
+              --jq "[.[] | select(.context == \"$BUILD_CONTEXT\")][0].state // \"\"")
+            if [ -z "$state" ] || [ "$branch" = "$FORCE_BRANCH" ]; then
+              builds=$(jq -c --arg b "$branch" --arg s "$sha" '. + [{branch: $b, sha: $s}]' <<< "$builds")
+            fi
+          done
+          echo "Builds: $builds"
+          echo "builds=$builds" >> "$GITHUB_OUTPUT"
+
+      - name: Fail on rebase conflicts
+        if: steps.rebase.outputs.conflicts != ''
+        run: |
+          echo "::error::Branches with conflicts: ${{ steps.rebase.outputs.conflicts }}"
+          exit 1
+
+  build:
+    needs: sync
+    if: ${{ !cancelled() && needs.sync.outputs.builds != '' && needs.sync.outputs.builds != '[]' }}
+    runs-on: macos-26
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.sync.outputs.builds) }}
+    name: build (${{ matrix.branch }})
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      BAZEL_CACHE: ${{ github.workspace }}/../telegram-bazel-cache
+    steps:
+      - name: Mark build pending
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/${{ matrix.sha }}" -f state=pending -f context="$BUILD_CONTEXT" \
+            -f description="Simulator build running" -f target_url="$RUN_URL" > /dev/null
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode from versions.json
+        id: xcode
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')
+          if [ -d "/Applications/Xcode_$version.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_$version.app/Contents/Developer"
+          else
+            echo "::warning::Xcode $version is not on this runner, using the default one"
+          fi
+          xcodebuild -version
+          echo "version=$(xcodebuild -version | head -1 | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        run: |
+          selected=$(dirname "$(dirname "$(xcode-select -p)")")
+          for app in /Applications/Xcode*.app; do
+            resolved=$(cd "$app" && pwd -P)
+            [ "$resolved" = "$(cd "$selected" && pwd -P)" ] || sudo rm -rf "$app"
+          done
+          sudo rm -rf ~/Library/Android /usr/local/share/dotnet || true
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Install Metal toolchain
+        run: xcrun metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Restore Bazel disk cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BAZEL_CACHE }}
+          key: bazel-sim-xcode${{ steps.xcode.outputs.version }}-${{ matrix.sha }}
+          restore-keys: |
+            bazel-sim-xcode${{ steps.xcode.outputs.version }}-
+
+      - name: Write simulator configuration
+        run: |
+          # Placeholder credentials: enough to compile, not to sign in.
+          mkdir -p build-input
+          cat > build-input/sim-configuration.json <<'EOF'
+          {
+            "bundle_id": "ph.telegra.Telegraph",
+            "api_id": "0",
+            "api_hash": "00000000000000000000000000000000",
+            "team_id": "C67CF9S4VU",
+            "app_center_id": "0",
+            "is_internal_build": "true",
+            "is_appstore_build": "false",
+            "appstore_id": "0",
+            "app_specific_url_scheme": "tg",
+            "premium_iap_product_id": "",
+            "enable_siri": false,
+            "enable_icloud": false
+          }
+          EOF
+
+      - name: Build for simulator
+        run: |
+          python3 -u build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --cacheDir="$BAZEL_CACHE" \
+            build \
+            --configurationPath=build-input/sim-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --buildNumber=1 \
+            --configuration=debug_sim_arm64
+
+      - name: Trim Bazel disk cache
+        if: always()
+        run: |
+          # Keep the saved cache under the 10 GB per-repo Actions limit: drop least recently used entries above 7 GB.
+          [ -d "$BAZEL_CACHE" ] || exit 0
+          limit=$((7 * 1024 * 1024))
+          size=$(du -sk "$BAZEL_CACHE" | cut -f1)
+          echo "Bazel cache: $((size / 1024)) MB"
+          [ "$size" -le "$limit" ] && exit 0
+          find "$BAZEL_CACHE" -type f -print0 | xargs -0 stat -f '%m %z %N' | sort -n | \
+            while read -r mtime bytes path; do
+              [ "$size" -le "$limit" ] && break
+              rm -f "$path"
+              size=$((size - bytes / 1024))
+            done
+          echo "Bazel cache after trim: $(( $(du -sk "$BAZEL_CACHE" | cut -f1) / 1024 )) MB"
+
+      - name: Report result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$JOB_STATUS" in
+            success) state=success; description="Simulator build passed" ;;
+            cancelled) state=error; description="Simulator build cancelled" ;;
+            *) state=failure; description="Simulator build failed" ;;
+          esac
+          gh api "repos/$GITHUB_REPOSITORY/statuses/${{ matrix.sha }}" -f state="$state" -f context="$BUILD_CONTEXT" \
+            -f description="$description" -f target_url="$RUN_URL" > /dev/null
