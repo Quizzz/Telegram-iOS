@@ -155,8 +155,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ matrix.sha }}
-          submodules: recursive
           fetch-depth: 1
+
+      - name: Fetch submodules from upstream
+        run: |
+          # .gitmodules uses relative URLs (../tgcalls.git), which would resolve to repos that don't exist
+          # under this fork's owner. Resolve them against upstream instead.
+          git remote set-url origin "$UPSTREAM_URL"
+          git submodule update --init --recursive --depth 1 --jobs 8
 
       - name: Select Xcode from versions.json
         id: xcode
