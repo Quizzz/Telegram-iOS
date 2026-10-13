@@ -30,7 +30,7 @@ env:
   UPSTREAM_URL: https://github.com/TelegramMessenger/Telegram-iOS.git
   BUILD_CONTEXT: fork-ci/simulator-build
   SYNC_CONTEXT: fork-ci/upstream-sync
-  # Branches that are never rebased or built.
+  # Branches that are never rebased or built (every upstream branch is added at runtime).
   SKIP_BRANCHES: 'master fork-automation'
 
 jobs:
@@ -54,6 +54,9 @@ jobs:
           git remote add upstream "$UPSTREAM_URL"
           git fetch -q --no-tags upstream master
           git fetch -q --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          # Branches copied from upstream when the fork was created (beta, dependabot/...) are not ours: leave them alone.
+          upstream_branches=$(git ls-remote --heads upstream | sed 's|.*refs/heads/||' | tr '\n' ' ')
+          echo "SKIP_BRANCHES=$SKIP_BRANCHES $upstream_branches" >> "$GITHUB_ENV"
 
       - name: Fast-forward master
         working-directory: repo

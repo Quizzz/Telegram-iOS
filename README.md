@@ -5,7 +5,7 @@ This branch only holds the automation for the fork. The code is in `master` and 
 ## Branches
 
 - `master` is an exact mirror of [TelegramMessenger/Telegram-iOS](https://github.com/TelegramMessenger/Telegram-iOS) `master`. Never commit to it.
-- Every other branch is a feature branch built on top of `master`. One branch per pull request, squashed to one commit, as [CONTRIBUTING.md](https://github.com/TelegramMessenger/Telegram-iOS/blob/master/.github/CONTRIBUTING.md) asks.
+- Every other branch whose name does not exist upstream is a feature branch built on top of `master`. Branches copied from upstream (`beta`, `dependabot/...`) are ignored. One branch per pull request, squashed to one commit, as [CONTRIBUTING.md](https://github.com/TelegramMessenger/Telegram-iOS/blob/master/.github/CONTRIBUTING.md) asks.
 - `fork-automation` is this branch, the default one, so that scheduled workflows can run.
 
 ## What `sync-upstream.yml` does (every 6 hours, or manually from the Actions tab)
